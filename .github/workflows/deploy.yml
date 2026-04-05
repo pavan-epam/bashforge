@@ -5,18 +5,17 @@ on:
     branches: [main]
 
 env:
-  AWS_REGION:     ap-south-1          # change to your region
+  AWS_REGION: ap-south-1 # change to your region
   ECR_REPO_PREFIX: bashforge
 
 jobs:
-
   # ── 1. Build and push all images to ECR ──────────────────────────
   build-push:
     name: Build & Push to ECR
     runs-on: ubuntu-latest
     outputs:
-      tag:              ${{ steps.meta.outputs.tag }}
-      ecr_registry:     ${{ steps.login-ecr.outputs.registry }}
+      tag: ${{ steps.meta.outputs.tag }}
+      ecr_registry: ${{ steps.login-ecr.outputs.registry }}
 
     steps:
       - uses: actions/checkout@v4
@@ -24,9 +23,9 @@ jobs:
       - name: Configure AWS credentials
         uses: aws-actions/configure-aws-credentials@v4
         with:
-          aws-access-key-id:      ${{ secrets.AWS_ACCESS_KEY_ID }}
-          aws-secret-access-key:  ${{ secrets.AWS_SECRET_ACCESS_KEY }}
-          aws-region:             ${{ env.AWS_REGION }}
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: ${{ env.AWS_REGION }}
 
       - name: Login to ECR
         id: login-ecr
@@ -40,7 +39,7 @@ jobs:
       - name: Build & push frontend
         env:
           REGISTRY: ${{ steps.login-ecr.outputs.registry }}
-          TAG:      ${{ steps.meta.outputs.tag }}
+          TAG: ${{ steps.meta.outputs.tag }}
         run: |
           docker build -t "$REGISTRY/$ECR_REPO_PREFIX-frontend:$TAG" ./frontend
           docker tag  "$REGISTRY/$ECR_REPO_PREFIX-frontend:$TAG" \
@@ -53,7 +52,7 @@ jobs:
       - name: Build & push backend
         env:
           REGISTRY: ${{ steps.login-ecr.outputs.registry }}
-          TAG:      ${{ steps.meta.outputs.tag }}
+          TAG: ${{ steps.meta.outputs.tag }}
         run: |
           docker build -t "$REGISTRY/$ECR_REPO_PREFIX-backend:$TAG" ./backend
           docker tag  "$REGISTRY/$ECR_REPO_PREFIX-backend:$TAG" \
@@ -65,7 +64,7 @@ jobs:
       - name: Build & push sandbox
         env:
           REGISTRY: ${{ steps.login-ecr.outputs.registry }}
-          TAG:      ${{ steps.meta.outputs.tag }}
+          TAG: ${{ steps.meta.outputs.tag }}
         run: |
           docker build -t "$REGISTRY/$ECR_REPO_PREFIX-sandbox:$TAG" ./sandbox
           docker tag  "$REGISTRY/$ECR_REPO_PREFIX-sandbox:$TAG" \
@@ -82,10 +81,10 @@ jobs:
       - name: Deploy to App EC2 via SSH
         uses: appleboy/ssh-action@v1.0.3
         with:
-          host:     ${{ secrets.EC2_APP_HOST }}
+          host: ${{ secrets.EC2_APP_HOST }}
           username: ubuntu
-          key:      ${{ secrets.EC2_APP_SSH_KEY }}
-          timeout:  120s
+          key: ${{ secrets.EC2_APP_SSH_KEY }}
+          timeout: 120s
           script: |
             set -euo pipefail
             REGION="${{ env.AWS_REGION }}"
@@ -128,10 +127,10 @@ jobs:
       - name: Pre-pull sandbox image on K8s EC2
         uses: appleboy/ssh-action@v1.0.3
         with:
-          host:     ${{ secrets.EC2_K8S_HOST }}
+          host: ${{ secrets.EC2_K8S_HOST }}
           username: ubuntu
-          key:      ${{ secrets.EC2_K8S_SSH_KEY }}
-          timeout:  180s
+          key: ${{ secrets.EC2_K8S_SSH_KEY }}
+          timeout: 180s
           script: |
             set -euo pipefail
             REGION="${{ env.AWS_REGION }}"
