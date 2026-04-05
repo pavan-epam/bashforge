@@ -1,0 +1,65 @@
+services:
+
+  # ── Redis ──────────────────────────────────────────────────────
+  redis:
+    image: redis:7-alpine
+    restart: unless-stopped
+    ports:
+      - "6379:6379"
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 5
+
+  # ── Sandbox (mock pod for local dev) ──────────────────────────
+  sandbox:
+    build:
+      context: ./sandbox
+    environment:
+      WS_TOKEN: "dev_token_not_secret"
+    ports:
+      - "8765:8765"
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8765/health"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 10s
+
+  # ── Backend ────────────────────────────────────────────────────
+  backend:
+    build:
+      context: ./backend
+    environment:
+      REDIS_URL: redis://redis:6379/0
+      MOCK_K8S: "true"
+      DEBUG: "true"
+      SECURE_COOKIES: "false"
+      CORS_ORIGINS: '["http://localhost:3000","http://localhost:5173"]'
+      COOKIE_SECRET: "dev_secret_change_in_production_please_32x"
+      MOCK_WS_TOKEN: "dev_token_not_secret"
+      SESSION_TTL_SECONDS: "3600"
+    ports:
+      - "8000:8000"
+    depends_on:
+      redis:
+        condition: service_healthy
+    restart: unless-stopped
+
+  # ── Frontend ────────────────────────────────────────────────────
+  # Builds React app and serves via Nginx on port 3000.
+  # For hot-reload dev instead run: cd frontend && npm install && npm run dev
+  frontend:
+    build:
+      context: ./frontend
+    ports:
+      - "3000:80"
+    depends_on:
+      - backend
+    restart: unless-stopped
+
+networks:
+  default:
+    name: bashforge-dev

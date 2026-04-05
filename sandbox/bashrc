@@ -1,0 +1,32 @@
+# BashForge sandbox .bashrc
+export TERM=xterm-256color
+export EDITOR=nano
+export PAGER=less
+
+# Colorized prompt: bashuser@bashforge:~/workspace$
+PS1='\[\033[01;32m\]\u@bashforge\[\033[00m\]:\[\033[01;34m\]\w\[\033[00m\]\$ '
+
+# Aliases
+alias ls='ls --color=auto'
+alias ll='ls -alF --color=auto'
+alias la='ls -A --color=auto'
+alias l='ls -CF --color=auto'
+alias grep='grep --color=auto'
+alias ..='cd ..'
+alias ...='cd ../..'
+alias mkx='chmod +x'
+
+# Bash options
+set -o vi 2>/dev/null || true
+shopt -s checkwinsize
+shopt -s histappend
+HISTSIZE=1000
+HISTFILESIZE=2000
+HISTCONTROL=ignoreboth
+
+# Welcome
+echo ""
+echo -e "\033[1;36m  BashForge Practice Environment\033[0m"
+echo -e "\033[0;37m  Workspace: $(pwd)\033[0m"
+echo -e "\033[0;37m  Type 'ls' to see your files, 'nano script.sh' to create a script.\033[0m"
+echo ""

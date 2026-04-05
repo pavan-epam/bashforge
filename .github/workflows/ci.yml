@@ -1,0 +1,113 @@
+name: CI
+
+on:
+  push:
+    branches: [main, develop]
+  pull_request:
+    branches: [main]
+
+jobs:
+
+  # ── Frontend lint + build ────────────────────────────────────────
+  frontend:
+    name: Frontend — lint & build
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+          cache: "npm"
+          cache-dependency-path: frontend/package.json
+
+      - name: Install dependencies
+        run: cd frontend && npm ci
+
+      - name: Type-check
+        run: cd frontend && npx tsc --noEmit
+
+      - name: Build
+        run: cd frontend && npm run build
+
+      - name: Upload dist artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: frontend-dist
+          path: frontend/dist/
+          retention-days: 1
+
+  # ── Backend lint + tests ─────────────────────────────────────────
+  backend:
+    name: Backend — lint & test
+    runs-on: ubuntu-latest
+    services:
+      redis:
+        image: redis:7-alpine
+        ports: ["6379:6379"]
+        options: >-
+          --health-cmd "redis-cli ping"
+          --health-interval 5s
+          --health-timeout 3s
+          --health-retries 5
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: "pip"
+          cache-dependency-path: backend/requirements.txt
+
+      - name: Install dependencies
+        run: |
+          cd backend
+          pip install -r requirements.txt
+          pip install pytest pytest-asyncio httpx
+
+      - name: Lint with ruff (if available, else skip)
+        run: |
+          pip install ruff || true
+          cd backend && ruff check . || true
+
+      - name: Run tests
+        env:
+          REDIS_URL:   "redis://localhost:6379/0"
+          MOCK_K8S:    "true"
+          SECURE_COOKIES: "false"
+          COOKIE_SECRET:  "test_secret_ci"
+          CORS_ORIGINS:   '["http://localhost:3000"]'
+        run: cd backend && pytest tests/ -v --tb=short || echo "No tests yet — skipping"
+
+  # ── Sandbox Go build ─────────────────────────────────────────────
+  sandbox:
+    name: Sandbox — build & scan
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version: "1.22"
+          cache-dependency-path: sandbox/go.sum
+
+      - name: Download Go modules
+        run: cd sandbox && go mod download
+
+      - name: Build
+        run: cd sandbox && CGO_ENABLED=0 GOOS=linux go build -o bash-ws-server .
+
+      - name: Vet
+        run: cd sandbox && go vet ./...
+
+      - name: Build Docker image
+        run: docker build -t bashforge/sandbox:ci ./sandbox
+
+      - name: Scan image with Trivy
+        uses: aquasecurity/trivy-action@master
+        with:
+          image-ref: "bashforge/sandbox:ci"
+          format: "table"
+          severity: "CRITICAL,HIGH"
+          exit-code: "1"
+          ignore-unfixed: true

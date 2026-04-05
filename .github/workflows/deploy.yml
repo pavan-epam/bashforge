@@ -1,0 +1,154 @@
+name: Deploy
+
+on:
+  push:
+    branches: [main]
+
+env:
+  AWS_REGION:     ap-south-1          # change to your region
+  ECR_REPO_PREFIX: bashforge
+
+jobs:
+
+  # ── 1. Build and push all images to ECR ──────────────────────────
+  build-push:
+    name: Build & Push to ECR
+    runs-on: ubuntu-latest
+    outputs:
+      tag:              ${{ steps.meta.outputs.tag }}
+      ecr_registry:     ${{ steps.login-ecr.outputs.registry }}
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id:      ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key:  ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region:             ${{ env.AWS_REGION }}
+
+      - name: Login to ECR
+        id: login-ecr
+        uses: aws-actions/amazon-ecr-login@v2
+
+      - name: Set image tag
+        id: meta
+        run: echo "tag=${{ github.sha }}" >> "$GITHUB_OUTPUT"
+
+      # Frontend
+      - name: Build & push frontend
+        env:
+          REGISTRY: ${{ steps.login-ecr.outputs.registry }}
+          TAG:      ${{ steps.meta.outputs.tag }}
+        run: |
+          docker build -t "$REGISTRY/$ECR_REPO_PREFIX-frontend:$TAG" ./frontend
+          docker tag  "$REGISTRY/$ECR_REPO_PREFIX-frontend:$TAG" \
+                      "$REGISTRY/$ECR_REPO_PREFIX-frontend:latest"
+          docker push "$REGISTRY/$ECR_REPO_PREFIX-frontend:$TAG"
+          docker push "$REGISTRY/$ECR_REPO_PREFIX-frontend:latest"
+          echo "Pushed frontend: $REGISTRY/$ECR_REPO_PREFIX-frontend:$TAG"
+
+      # Backend
+      - name: Build & push backend
+        env:
+          REGISTRY: ${{ steps.login-ecr.outputs.registry }}
+          TAG:      ${{ steps.meta.outputs.tag }}
+        run: |
+          docker build -t "$REGISTRY/$ECR_REPO_PREFIX-backend:$TAG" ./backend
+          docker tag  "$REGISTRY/$ECR_REPO_PREFIX-backend:$TAG" \
+                      "$REGISTRY/$ECR_REPO_PREFIX-backend:latest"
+          docker push "$REGISTRY/$ECR_REPO_PREFIX-backend:$TAG"
+          docker push "$REGISTRY/$ECR_REPO_PREFIX-backend:latest"
+
+      # Sandbox
+      - name: Build & push sandbox
+        env:
+          REGISTRY: ${{ steps.login-ecr.outputs.registry }}
+          TAG:      ${{ steps.meta.outputs.tag }}
+        run: |
+          docker build -t "$REGISTRY/$ECR_REPO_PREFIX-sandbox:$TAG" ./sandbox
+          docker tag  "$REGISTRY/$ECR_REPO_PREFIX-sandbox:$TAG" \
+                      "$REGISTRY/$ECR_REPO_PREFIX-sandbox:latest"
+          docker push "$REGISTRY/$ECR_REPO_PREFIX-sandbox:$TAG"
+          docker push "$REGISTRY/$ECR_REPO_PREFIX-sandbox:latest"
+
+  # ── 2. Deploy frontend + backend to App EC2 ──────────────────────
+  deploy-app:
+    name: Deploy App EC2
+    runs-on: ubuntu-latest
+    needs: build-push
+    steps:
+      - name: Deploy to App EC2 via SSH
+        uses: appleboy/ssh-action@v1.0.3
+        with:
+          host:     ${{ secrets.EC2_APP_HOST }}
+          username: ubuntu
+          key:      ${{ secrets.EC2_APP_SSH_KEY }}
+          timeout:  120s
+          script: |
+            set -euo pipefail
+            REGION="${{ env.AWS_REGION }}"
+            REGISTRY="${{ needs.build-push.outputs.ecr_registry }}"
+            TAG="${{ needs.build-push.outputs.tag }}"
+            PREFIX="${{ env.ECR_REPO_PREFIX }}"
+
+            echo "=== Pulling new images ==="
+            aws ecr get-login-password --region "$REGION" | \
+                docker login --username AWS --password-stdin "$REGISTRY"
+
+            docker pull "$REGISTRY/${PREFIX}-frontend:$TAG"
+            docker pull "$REGISTRY/${PREFIX}-backend:$TAG"
+
+            echo "=== Updating docker-compose.prod.yml ==="
+            cd /opt/bashforge
+            # Atomically update image tags
+            sed -i "s|${REGISTRY}/${PREFIX}-frontend:.*|${REGISTRY}/${PREFIX}-frontend:${TAG}|g" \
+                docker-compose.prod.yml
+            sed -i "s|${REGISTRY}/${PREFIX}-backend:.*|${REGISTRY}/${PREFIX}-backend:${TAG}|g" \
+                docker-compose.prod.yml
+
+            echo "=== Rolling deploy (no downtime) ==="
+            docker compose -f docker-compose.prod.yml up -d --no-deps --remove-orphans frontend backend
+
+            echo "=== Health check ==="
+            sleep 5
+            curl -sf http://localhost:8000/api/health && echo "Backend: OK" || echo "Backend: FAIL"
+            curl -sf http://localhost:8080/  && echo "Frontend: OK" || echo "Frontend: FAIL"
+
+            echo "=== Pruning old images ==="
+            docker image prune -f --filter "until=24h"
+
+  # ── 3. Pre-pull sandbox image on K8s EC2 ─────────────────────────
+  deploy-sandbox:
+    name: Pre-pull sandbox on K8s EC2
+    runs-on: ubuntu-latest
+    needs: build-push
+    steps:
+      - name: Pre-pull sandbox image on K8s EC2
+        uses: appleboy/ssh-action@v1.0.3
+        with:
+          host:     ${{ secrets.EC2_K8S_HOST }}
+          username: ubuntu
+          key:      ${{ secrets.EC2_K8S_SSH_KEY }}
+          timeout:  180s
+          script: |
+            set -euo pipefail
+            REGION="${{ env.AWS_REGION }}"
+            REGISTRY="${{ needs.build-push.outputs.ecr_registry }}"
+            TAG="${{ needs.build-push.outputs.tag }}"
+            PREFIX="${{ env.ECR_REPO_PREFIX }}"
+
+            echo "=== Login to ECR ==="
+            aws ecr get-login-password --region "$REGION" | \
+                docker login --username AWS --password-stdin "$REGISTRY"
+
+            echo "=== Pre-pulling sandbox into Minikube's Docker daemon ==="
+            eval $(minikube docker-env)
+            docker pull "$REGISTRY/${PREFIX}-sandbox:$TAG"
+            docker tag  "$REGISTRY/${PREFIX}-sandbox:$TAG" \
+                        "bashforge/sandbox:latest"
+            echo "Sandbox image ready in Minikube: bashforge/sandbox:latest"
+
+            echo "=== Current pods ==="
+            kubectl get pods -n bashforge-sessions 2>/dev/null || true
