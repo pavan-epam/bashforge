@@ -15,7 +15,7 @@ RUN apt-get update && DEBIAN_FRONTEND=noninteractive apt-get install -y --no-ins
     curl wget git vim-tiny nano jq bc \
     tar gzip bzip2 xz-utils unzip less \
     man-db tree file diffutils patch \
-    python3 python3-pip netcat-openbsd \
+    python3 python3-pip netcat-openbsd dos2unix \
     && rm -rf /var/lib/apt/lists/* \
     && groupadd -g 1000 bashuser \
     && useradd -u 1000 -g 1000 -m -s /bin/bash -d /home/bashuser bashuser \
@@ -27,7 +27,13 @@ RUN apt-get update && DEBIAN_FRONTEND=noninteractive apt-get install -y --no-ins
 
 COPY --from=builder /build/bash-ws-server /usr/local/bin/bash-ws-server
 RUN chmod +x /usr/local/bin/bash-ws-server
-COPY --chown=bashuser:bashuser bashrc /home/bashuser/.bashrc
+
+# Copy bashrc and force Unix line endings (dos2unix) to prevent \r\n errors
+COPY bashrc /tmp/bashrc_raw
+RUN dos2unix /tmp/bashrc_raw && \
+    cp /tmp/bashrc_raw /home/bashuser/.bashrc && \
+    chown bashuser:bashuser /home/bashuser/.bashrc && \
+    chmod 644 /home/bashuser/.bashrc
 
 USER bashuser
 WORKDIR /home/bashuser/workspace

@@ -2,31 +2,77 @@
 export TERM=xterm-256color
 export EDITOR=nano
 export PAGER=less
+export COLORTERM=truecolor
 
-# Colorized prompt: bashuser@bashforge:~/workspace$
+# Prompt
 PS1='\[\033[01;32m\]\u@bashforge\[\033[00m\]:\[\033[01;34m\]\w\[\033[00m\]\$ '
 
 # Aliases
 alias ls='ls --color=auto'
-alias ll='ls -alF --color=auto'
-alias la='ls -A --color=auto'
-alias l='ls -CF --color=auto'
+alias ll='ls -alF'
+alias la='ls -A'
+alias l='ls -CF'
 alias grep='grep --color=auto'
 alias ..='cd ..'
 alias ...='cd ../..'
 alias mkx='chmod +x'
 
-# Bash options
-set -o vi 2>/dev/null || true
+# Shell Options & History
 shopt -s checkwinsize
 shopt -s histappend
 HISTSIZE=1000
 HISTFILESIZE=2000
 HISTCONTROL=ignoreboth
 
-# Welcome
-echo ""
-echo -e "\033[1;36m  BashForge Practice Environment\033[0m"
-echo -e "\033[0;37m  Workspace: $(pwd)\033[0m"
-echo -e "\033[0;37m  Type 'ls' to see your files, 'nano script.sh' to create a script.\033[0m"
-echo ""
+# ── Safety wrapper: prevent wiping the entire home/workspace ──────
+rm() {
+    # Block rm -rf on critical paths
+    local _rf=0 _paths=()
+    for _arg in "$@"; do
+        case "$_arg" in
+            -r*f*|-f*r*|--recursive) _rf=1 ;;
+        esac
+    done
+    for _arg in "$@"; do
+        if [[ "$_arg" != -* ]]; then
+            _paths+=("$_arg")
+        fi
+    done
+    if [[ $_rf -eq 1 ]]; then
+        for _p in "${_paths[@]}"; do
+            local _abs
+            _abs="$(cd "$(dirname "$_p" 2>/dev/null)" 2>/dev/null && pwd)/$(basename "$_p")" 2>/dev/null || _abs="$_p"
+            case "$_abs" in
+                /|/home|/home/bashuser|/home/bashuser/workspace)
+                    echo "rm: refusing to remove protected path: $_abs" >&2
+                    return 1 ;;
+            esac
+        done
+    fi
+    command rm "$@"
+}
+
+# ── Banner: auto-sized based on terminal width ────────────────────
+_show_banner() {
+    local cols="${COLUMNS:-80}"
+    if [[ "$cols" -ge 88 ]]; then
+        echo -e "\e[1;36m"
+        cat << "BANNER"
+ ██████╗  █████╗ ███████╗██╗  ██╗███████╗ ██████╗ ██████╗  ██████╗ ███████╗
+ ██╔══██╗██╔══██╗██╔════╝██║  ██║██╔════╝██╔═══██╗██╔══██╗██╔════╝ ██╔════╝
+ ██████╔╝███████║███████╗███████║█████╗  ██║   ██║██████╔╝██║  ███╗█████╗
+ ██╔══██╗██╔══██║╚════██║██╔══██║██╔══╝  ██║   ██║██╔══██╗██║   ██║██╔══╝
+ ██████╔╝██║  ██║███████║██║  ██║██║     ╚██████╔╝██║  ██║╚██████╔╝███████╗
+ ╚═════╝ ╚═╝  ╚═╝╚══════╝╚═╝  ╚═╝╚═╝      ╚═════╝ ╚═╝  ╚═╝ ╚═════╝ ╚══════╝
+BANNER
+        echo -e "\e[0m"
+    else
+        echo -e "\e[1;36m  ⚡ BashForge\e[0m"
+    fi
+    echo "  Online Bash IDE"
+    echo "  Contribute: https://github.com/pth55/bashforge"
+    echo "  Authors: Pavan, Ojha, Pranav"
+    echo "  Working Dir: $(pwd)"
+    echo ""
+}
+_show_banner

@@ -26,6 +26,7 @@ const (
 
 var (
 	wsToken   = os.Getenv("WS_TOKEN")
+	homeDir   = "/home/bashuser"
 	workspace = "/home/bashuser/workspace"
 	upgrader  = websocket.Upgrader{
 		CheckOrigin:     func(r *http.Request) bool { return true },
@@ -38,6 +39,7 @@ type CtrlMsg struct {
 	Type    string   `json:"type"`
 	Token   string   `json:"token,omitempty"`
 	Path    string   `json:"path,omitempty"`
+	Dir     string   `json:"dir,omitempty"`
 	Name    string   `json:"name,omitempty"`
 	Content string   `json:"content,omitempty"`
 	Args    []string `json:"args,omitempty"`
@@ -47,6 +49,7 @@ type CtrlMsg struct {
 
 type FileInfo struct {
 	Name     string `json:"name"`
+	Path     string `json:"path"`
 	Size     int64  `json:"size"`
 	Modified int64  `json:"modified"`
 	IsDir    bool   `json:"is_dir"`
@@ -84,7 +87,7 @@ func (s *Session) sendBinary(channel byte, data []byte) error {
 }
 
 func resizePty(f *os.File, cols, rows uint16) {
-	if f == nil {
+	if f == nil || cols == 0 || rows == 0 {
 		return
 	}
 	ws := struct{ rows, cols, xpixel, ypixel uint16 }{rows, cols, 0, 0}
@@ -96,10 +99,13 @@ func (s *Session) startTerminal() error {
 	cmd := exec.Command("/bin/bash", "--login")
 	cmd.Env = append(os.Environ(),
 		"TERM=xterm-256color",
-		"PS1=\\[\\033[32m\\]\\u@bashforge\\[\\033[0m\\]:\\[\\033[34m\\]\\w\\[\\033[0m\\]$ ",
+		"COLORTERM=truecolor",
 		"HOME=/home/bashuser",
+		"USER=bashuser",
+		"SHELL=/bin/bash",
 	)
 	cmd.Dir = workspace
+
 	ptmx, err := pty.Start(cmd)
 	if err != nil {
 		return fmt.Errorf("pty.Start terminal: %w", err)
@@ -112,9 +118,7 @@ func (s *Session) startTerminal() error {
 		for {
 			n, err := ptmx.Read(buf)
 			if n > 0 {
-				if sendErr := s.sendBinary(ChTerminal, buf[:n]); sendErr != nil {
-					break
-				}
+				s.sendBinary(ChTerminal, buf[:n])
 			}
 			if err != nil {
 				break
@@ -138,8 +142,12 @@ func (s *Session) runScript(path, content string, args []string) {
 	}
 	s.scriptMu.Unlock()
 
+	// Write script to workspace with Unix line endings
 	fullPath := filepath.Join(workspace, filepath.Base(path))
-	if err := os.WriteFile(fullPath, []byte(content), 0755); err != nil {
+	// Normalize line endings: replace \r\n and lone \r with \n
+	normalized := strings.ReplaceAll(content, "\r\n", "\n")
+	normalized = strings.ReplaceAll(normalized, "\r", "\n")
+	if err := os.WriteFile(fullPath, []byte(normalized), 0755); err != nil {
 		s.sendJSON(map[string]any{"type": "error", "message": "Cannot write script: " + err.Error()})
 		return
 	}
@@ -148,7 +156,11 @@ func (s *Session) runScript(path, content string, args []string) {
 
 	cmdArgs := append([]string{fullPath}, args...)
 	cmd := exec.Command("/bin/bash", cmdArgs...)
-	cmd.Env = append(os.Environ(), "TERM=xterm-256color")
+	cmd.Env = append(os.Environ(),
+		"TERM=xterm-256color",
+		"HOME=/home/bashuser",
+		"USER=bashuser",
+	)
 	cmd.Dir = workspace
 	cmd.SysProcAttr = &syscall.SysProcAttr{Setsid: true}
 
@@ -164,6 +176,7 @@ func (s *Session) runScript(path, content string, args []string) {
 	s.scriptMu.Unlock()
 
 	start := time.Now()
+
 	go func() {
 		buf := make([]byte, 4096)
 		for {
@@ -181,59 +194,120 @@ func (s *Session) runScript(path, content string, args []string) {
 			rc = cmd.ProcessState.ExitCode()
 		}
 		elapsed := time.Since(start).Seconds()
+
 		s.scriptMu.Lock()
 		s.scriptPty = nil
 		s.scriptCmd = nil
 		s.scriptMu.Unlock()
-		s.sendJSON(map[string]any{"type": "script_done", "exit_code": rc, "elapsed": elapsed})
+
+		s.sendJSON(map[string]any{
+			"type":      "script_done",
+			"exit_code": rc,
+			"elapsed":   elapsed,
+		})
 	}()
 }
 
-func (s *Session) handleFileList() {
-	entries, err := os.ReadDir(workspace)
+// safeInHome checks path is inside homeDir (allows workspace + home)
+func safeInHome(path string) bool {
+	abs, err := filepath.Abs(path)
+	if err != nil {
+		return false
+	}
+	return strings.HasPrefix(abs, homeDir+"/") || abs == homeDir
+}
+
+func (s *Session) handleFileList(dir string) {
+	if dir == "" {
+		dir = workspace
+	}
+	// Resolve relative paths from workspace
+	if !filepath.IsAbs(dir) {
+		dir = filepath.Join(workspace, dir)
+	}
+	dir = filepath.Clean(dir)
+	if !safeInHome(dir) {
+		s.sendJSON(map[string]any{"type": "error", "message": "Access denied"})
+		return
+	}
+
+	entries, err := os.ReadDir(dir)
 	if err != nil {
 		s.sendJSON(map[string]any{"type": "error", "message": err.Error()})
 		return
 	}
 	files := make([]FileInfo, 0, len(entries))
 	for _, e := range entries {
+		// Skip hidden files (except .bashrc)
+		if strings.HasPrefix(e.Name(), ".") && e.Name() != ".bashrc" {
+			continue
+		}
 		info, _ := e.Info()
 		if info == nil {
 			continue
 		}
+		relPath, _ := filepath.Rel(homeDir, filepath.Join(dir, e.Name()))
 		files = append(files, FileInfo{
-			Name: e.Name(), Size: info.Size(),
-			Modified: info.ModTime().Unix(), IsDir: e.IsDir(),
+			Name:     e.Name(),
+			Path:     relPath,
+			Size:     info.Size(),
+			Modified: info.ModTime().Unix(),
+			IsDir:    e.IsDir(),
 		})
 	}
-	s.sendJSON(map[string]any{"type": "file_list_result", "files": files})
+	s.sendJSON(map[string]any{"type": "file_list_result", "files": files, "dir": dir})
 }
 
 func (s *Session) handleFileRead(path string) {
-	safe := filepath.Join(workspace, filepath.Clean("/"+path))
-	if !strings.HasPrefix(safe, workspace) {
+	var fullPath string
+	if filepath.IsAbs(path) {
+		fullPath = filepath.Clean(path)
+	} else {
+		// Try workspace first, then home
+		candidate := filepath.Join(workspace, filepath.Clean("/"+path))
+		if _, err := os.Stat(candidate); err == nil {
+			fullPath = candidate
+		} else {
+			fullPath = filepath.Join(homeDir, filepath.Clean("/"+path))
+		}
+	}
+	if !safeInHome(fullPath) {
 		s.sendJSON(map[string]any{"type": "error", "message": "Access denied"})
 		return
 	}
-	data, err := os.ReadFile(safe)
+	data, err := os.ReadFile(fullPath)
 	if err != nil {
 		s.sendJSON(map[string]any{"type": "error", "message": err.Error()})
 		return
 	}
-	s.sendJSON(map[string]any{"type": "file_content", "path": filepath.Base(path), "content": string(data)})
+	relPath, _ := filepath.Rel(homeDir, fullPath)
+	s.sendJSON(map[string]any{
+		"type":    "file_content",
+		"path":    relPath,
+		"content": string(data),
+	})
 }
 
 func (s *Session) handleFileWrite(path, content string) {
-	safe := filepath.Join(workspace, filepath.Clean("/"+filepath.Base(path)))
-	if !strings.HasPrefix(safe, workspace) {
+	var fullPath string
+	if filepath.IsAbs(path) {
+		fullPath = filepath.Clean(path)
+	} else {
+		fullPath = filepath.Join(workspace, filepath.Base(path))
+	}
+	if !safeInHome(fullPath) {
 		s.sendJSON(map[string]any{"type": "error", "message": "Access denied"})
 		return
 	}
-	if err := os.WriteFile(safe, []byte(content), 0644); err != nil {
+	// Normalize line endings
+	normalized := strings.ReplaceAll(content, "\r\n", "\n")
+	normalized = strings.ReplaceAll(normalized, "\r", "\n")
+	if err := os.WriteFile(fullPath, []byte(normalized), 0644); err != nil {
 		s.sendJSON(map[string]any{"type": "error", "message": err.Error()})
 		return
 	}
-	s.sendJSON(map[string]any{"type": "file_written", "path": filepath.Base(path)})
+	relPath, _ := filepath.Rel(homeDir, fullPath)
+	s.sendJSON(map[string]any{"type": "file_written", "path": relPath})
 }
 
 func (s *Session) handleFileNew(name string) {
@@ -241,7 +315,8 @@ func (s *Session) handleFileNew(name string) {
 	if _, err := os.Stat(safe); os.IsNotExist(err) {
 		os.WriteFile(safe, []byte("#!/bin/bash\n\nset -euo pipefail\n\n"), 0644)
 	}
-	s.sendJSON(map[string]any{"type": "file_created", "name": filepath.Base(name)})
+	relPath, _ := filepath.Rel(homeDir, safe)
+	s.sendJSON(map[string]any{"type": "file_created", "name": filepath.Base(name), "path": relPath})
 }
 
 func handleWS(w http.ResponseWriter, r *http.Request) {
@@ -252,42 +327,25 @@ func handleWS(w http.ResponseWriter, r *http.Request) {
 	}
 	defer conn.Close()
 
-	// Set up ping/pong handlers so Python's websockets library stays happy
-	// gorilla/websocket does NOT auto-respond to pings — must set handler explicitly
-	conn.SetPongHandler(func(data string) error {
-		return nil
-	})
-	conn.SetPingHandler(func(data string) error {
-		return conn.WriteControl(
-			websocket.PongMessage,
-			[]byte(data),
-			time.Now().Add(5*time.Second),
-		)
-	})
-
 	sess := &Session{conn: conn}
 
-	// Authenticate
-	conn.SetReadDeadline(time.Now().Add(15 * time.Second))
+	conn.SetReadDeadline(time.Now().Add(10 * time.Second))
 	_, raw, err := conn.ReadMessage()
-	conn.SetReadDeadline(time.Time{}) // clear deadline
 	if err != nil {
 		log.Printf("Auth read error: %v", err)
 		return
 	}
+	conn.SetReadDeadline(time.Time{})
 
 	var authMsg CtrlMsg
 	if json.Unmarshal(raw, &authMsg) != nil || authMsg.Type != "auth" || authMsg.Token != wsToken {
-		log.Printf("Auth failed — got type=%q token_len=%d", authMsg.Type, len(authMsg.Token))
+		log.Printf("Auth failed")
 		conn.WriteMessage(websocket.TextMessage, []byte(`{"type":"error","message":"Authentication failed"}`))
 		return
 	}
-	log.Printf("Auth OK for new session")
 
-	// Start terminal shell
 	if err := sess.startTerminal(); err != nil {
 		log.Printf("Terminal start error: %v", err)
-		conn.WriteMessage(websocket.TextMessage, []byte(`{"type":"error","message":"Failed to start shell"}`))
 		return
 	}
 	defer func() {
@@ -300,13 +358,10 @@ func handleWS(w http.ResponseWriter, r *http.Request) {
 	}()
 
 	resizePty(sess.termPty, 220, 50)
-	log.Printf("Session ready, entering message loop")
 
-	// Message loop
 	for {
 		msgType, data, err := conn.ReadMessage()
 		if err != nil {
-			log.Printf("Read error (session ending): %v", err)
 			break
 		}
 
@@ -314,7 +369,7 @@ func handleWS(w http.ResponseWriter, r *http.Request) {
 			if len(data) < 2 {
 				continue
 			}
-			ch      := data[0]
+			ch := data[0]
 			payload := data[1:]
 			if ch == ChTerminal && sess.termPty != nil {
 				sess.termPty.Write(payload)
@@ -333,7 +388,6 @@ func handleWS(w http.ResponseWriter, r *http.Request) {
 		if json.Unmarshal(data, &msg) != nil {
 			continue
 		}
-		log.Printf("Control msg: %s", msg.Type)
 
 		switch msg.Type {
 		case "run_script":
@@ -345,11 +399,9 @@ func handleWS(w http.ResponseWriter, r *http.Request) {
 			}
 			sess.scriptMu.Unlock()
 		case "resize_terminal":
-			if msg.Cols > 0 && msg.Rows > 0 {
-				resizePty(sess.termPty, msg.Cols, msg.Rows)
-			}
+			resizePty(sess.termPty, msg.Cols, msg.Rows)
 		case "file_list":
-			sess.handleFileList()
+			sess.handleFileList(msg.Dir)
 		case "file_read":
 			sess.handleFileRead(msg.Path)
 		case "file_write":
@@ -367,13 +419,16 @@ func main() {
 	if err := os.MkdirAll(workspace, 0755); err != nil {
 		log.Fatal("Cannot create workspace:", err)
 	}
+
 	http.HandleFunc("/ws", handleWS)
 	http.HandleFunc("/health", func(w http.ResponseWriter, _ *http.Request) {
 		w.WriteHeader(200)
 		w.Write([]byte("ok"))
 	})
-	log.Printf("bash-ws-server listening on :8765")
-	if err := http.ListenAndServe(":8765", nil); err != nil {
+
+	addr := ":8765"
+	log.Printf("bash-ws-server listening on %s", addr)
+	if err := http.ListenAndServe(addr, nil); err != nil {
 		log.Fatal(err)
 	}
 }

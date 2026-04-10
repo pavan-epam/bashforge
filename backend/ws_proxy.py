@@ -11,8 +11,9 @@ import time
 from typing import Optional
 
 import websockets
-from websockets.exceptions import ConnectionClosed, WebSocketException
-from fastapi import WebSocket, WebSocketDisconnect
+import websockets.exceptions
+from fastapi import WebSocket
+from starlette.websockets import WebSocketDisconnect
 
 log = logging.getLogger(__name__)
 
@@ -88,7 +89,7 @@ class WSProxy:
                 except (asyncio.CancelledError, Exception):
                     pass
 
-        except (ConnectionClosed, WebSocketException) as e:
+        except (websockets.exceptions.ConnectionClosed, websockets.exceptions.WebSocketException) as e:
             log.warning("Pod WS closed for session %s: %s", self.session_id, e)
             await self._send_error("Connection to your container was lost. Please refresh.")
         except Exception as e:
@@ -149,7 +150,7 @@ class WSProxy:
 
         except WebSocketDisconnect:
             pass
-        except (ConnectionClosed, WebSocketException):
+        except (websockets.exceptions.ConnectionClosed, websockets.exceptions.WebSocketException):
             raise
         except Exception as e:
             log.debug("browser→pod ended: %s", e)
@@ -169,7 +170,7 @@ class WSProxy:
                             log.debug("Pod→Browser control: %s", parsed.get("type"))
                     except Exception:
                         pass
-        except (ConnectionClosed, WebSocketException):
+        except (websockets.exceptions.ConnectionClosed, websockets.exceptions.WebSocketException):
             raise
         except Exception as e:
             log.debug("pod→browser ended: %s", e)

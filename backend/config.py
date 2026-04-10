@@ -11,7 +11,7 @@ class Settings(BaseSettings):
     # Session
     session_ttl_seconds: int = 3600           # 1 hour
     session_cookie_name: str = "bashforge_session"
-    max_concurrent_sessions: int = 20
+    max_concurrent_sessions: int = 50
 
     # Kubernetes
     k8s_namespace:       str = "bashforge-sessions"

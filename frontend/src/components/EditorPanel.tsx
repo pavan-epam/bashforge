@@ -60,11 +60,17 @@ export function EditorPanel({
       () => editor.trigger('keyboard', 'editor.action.copyLinesDownAction', null),
     )
 
-    // Ctrl+F → Open find (Monaco built-in find widget)
-    // Already handled by Monaco natively
-
-    // Ctrl+H → Open find+replace
-    // Already handled by Monaco natively
+    // Ctrl+F opens Monaco find, Ctrl+H opens find+replace
+    // Both are handled natively by Monaco.
+    // Escape should close find widget — bind explicitly so our global keydown
+    // handler doesn't interfere:
+    editor.addCommand(
+      monaco.KeyCode.Escape,
+      () => {
+        // Close find widget if it's open, otherwise do nothing
+        editor.trigger('keyboard', 'closeFindWidget', null)
+      },
+    )
 
     // Cursor position updates
     editor.onDidChangeCursorPosition((e) => {

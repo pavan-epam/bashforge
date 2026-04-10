@@ -114,13 +114,21 @@ async def api_create_session(request: Request, response: Response):
                 # Expired — clean up
                 await terminate_session(existing_id)
 
-    # Check global cap
-    from redis_client import session_list_all
+    # Check global cap (50 concurrent max)
+    from redis_client import session_list_all, session_ttl as get_ttl
     active = await session_list_all()
-    if len(active) >= settings.max_concurrent_sessions:
+    MAX_SESSIONS = 50
+    if len(active) >= MAX_SESSIONS:
+        # Find the session closest to expiry to estimate wait time
+        ttls = []
+        for sid in active:
+            t = await get_ttl(sid)
+            if t > 0:
+                ttls.append(t)
+        min_wait = min(ttls) if ttls else 60
         raise HTTPException(
             status_code=503,
-            detail="All practice slots are currently in use. Please try again in a few minutes.",
+            detail=f"CAPACITY_REACHED:{len(active)}:{MAX_SESSIONS}:{min_wait}",
         )
 
     # Create new
