@@ -28,6 +28,16 @@ RUN apt-get update && DEBIAN_FRONTEND=noninteractive apt-get install -y --no-ins
 COPY --from=builder /build/bash-ws-server /usr/local/bin/bash-ws-server
 RUN chmod +x /usr/local/bin/bash-ws-server
 
+# Resource-limit wrapper — runs as root-owned so users cannot modify or bypass it.
+# Enforces per-session limits before exec-ing bash:
+#   -u 100  : max 100 processes (blocks fork bombs like :(){:|:&};:)
+#   -n 256  : max 256 open file descriptors
+#   -t 60   : max 60 CPU-seconds (script CPU time hard cap; Go wall-clock timer
+#             catches infinite sleep loops independently)
+RUN printf '#!/bin/bash\nulimit -u 100 -n 256 -t 60 2>/dev/null\nexec "$@"\n' \
+        > /usr/local/bin/bashforge-run && \
+    chmod 755 /usr/local/bin/bashforge-run
+
 # Copy bashrc and force Unix line endings (dos2unix) to prevent \r\n errors
 COPY bashrc /tmp/bashrc_raw
 RUN dos2unix /tmp/bashrc_raw && \

@@ -73,6 +73,8 @@ spec:
       mountPath: /home/bashuser/workspace
     - name: tmp
       mountPath: /tmp
+    - name: shm
+      mountPath: /dev/shm
     env:
     - name: HOME
       value: /home/bashuser
@@ -87,6 +89,10 @@ spec:
   - name: tmp
     emptyDir:
       sizeLimit: "20Mi"
+  - name: shm
+    emptyDir:
+      medium: Memory
+      sizeLimit: "64Mi"
 """
 
 SVC_MANIFEST_TEMPLATE = """\

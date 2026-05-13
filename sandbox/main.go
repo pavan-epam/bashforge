@@ -8,6 +8,7 @@ import (
 	"net/http"
 	"os"
 	"os/exec"
+	"os/signal"
 	"path/filepath"
 	"strings"
 	"sync"
@@ -22,10 +23,21 @@ import (
 const (
 	ChTerminal = 0x01
 	ChScript   = 0x02
+
+	// scriptTimeout is the maximum wall-clock time a script may run before
+	// being forcibly terminated. Prevents infinite loops from tying up sessions.
+	scriptTimeout = 30 * time.Second
+
+	// runWrapper is a root-owned script that enforces ulimit restrictions before
+	// exec-ing bash. Using a wrapper (instead of bash -c "ulimit; exec ...") keeps
+	// script arguments safe from shell-injection.
+	runWrapper = "/usr/local/bin/bashforge-run"
 )
 
+// wsToken is read from the environment in main() and immediately cleared so it
+// cannot be leaked by a user reading /proc/1/environ.
 var (
-	wsToken   = os.Getenv("WS_TOKEN")
+	wsToken   string
 	homeDir   = "/home/bashuser"
 	workspace = "/home/bashuser/workspace"
 	upgrader  = websocket.Upgrader{
@@ -96,7 +108,9 @@ func resizePty(f *os.File, cols, rows uint16) {
 }
 
 func (s *Session) startTerminal() error {
-	cmd := exec.Command("/bin/bash", "--login")
+	// Run the resource-limit wrapper which enforces ulimit -u/-n before
+	// exec-ing the interactive bash. This prevents fork bombs and fd exhaustion.
+	cmd := exec.Command(runWrapper, "/bin/bash", "--login")
 	cmd.Env = append(os.Environ(),
 		"TERM=xterm-256color",
 		"COLORTERM=truecolor",
@@ -144,7 +158,6 @@ func (s *Session) runScript(path, content string, args []string) {
 
 	// Write script to workspace with Unix line endings
 	fullPath := filepath.Join(workspace, filepath.Base(path))
-	// Normalize line endings: replace \r\n and lone \r with \n
 	normalized := strings.ReplaceAll(content, "\r\n", "\n")
 	normalized = strings.ReplaceAll(normalized, "\r", "\n")
 	if err := os.WriteFile(fullPath, []byte(normalized), 0755); err != nil {
@@ -154,8 +167,10 @@ func (s *Session) runScript(path, content string, args []string) {
 
 	s.sendJSON(map[string]any{"type": "script_started"})
 
-	cmdArgs := append([]string{fullPath}, args...)
-	cmd := exec.Command("/bin/bash", cmdArgs...)
+	// Use the root-owned wrapper to enforce resource limits (ulimit -u/-n/-t).
+	// Passing args via exec.Command (not via shell interpolation) prevents injection.
+	wrapArgs := append([]string{"/bin/bash", fullPath}, args...)
+	cmd := exec.Command(runWrapper, wrapArgs...)
 	cmd.Env = append(os.Environ(),
 		"TERM=xterm-256color",
 		"HOME=/home/bashuser",
@@ -177,6 +192,25 @@ func (s *Session) runScript(path, content string, args []string) {
 
 	start := time.Now()
 
+	// Wall-clock timeout: kill the script if it runs longer than scriptTimeout.
+	// This catches infinite sleep loops that would bypass a CPU-time limit.
+	killTimer := time.AfterFunc(scriptTimeout, func() {
+		s.scriptMu.Lock()
+		if s.scriptCmd != nil && s.scriptCmd.Process != nil {
+			s.scriptCmd.Process.Signal(syscall.SIGTERM)
+			proc := s.scriptCmd.Process
+			s.scriptMu.Unlock()
+			// Grace period, then hard kill
+			time.AfterFunc(500*time.Millisecond, func() { proc.Kill() })
+		} else {
+			s.scriptMu.Unlock()
+		}
+		s.sendJSON(map[string]any{
+			"type":    "error",
+			"message": fmt.Sprintf("Script exceeded the %d-second time limit and was terminated.", int(scriptTimeout.Seconds())),
+		})
+	})
+
 	go func() {
 		buf := make([]byte, 4096)
 		for {
@@ -188,6 +222,7 @@ func (s *Session) runScript(path, content string, args []string) {
 				break
 			}
 		}
+		killTimer.Stop()
 		cmd.Wait()
 		rc := 0
 		if cmd.ProcessState != nil {
@@ -208,13 +243,28 @@ func (s *Session) runScript(path, content string, args []string) {
 	}()
 }
 
-// safeInHome checks path is inside homeDir (allows workspace + home)
+// safeInHome checks the lexical (un-resolved) path is inside homeDir.
+// Always pair with resolvedSafeInHome for any actual I/O operation.
 func safeInHome(path string) bool {
 	abs, err := filepath.Abs(path)
 	if err != nil {
 		return false
 	}
 	return strings.HasPrefix(abs, homeDir+"/") || abs == homeDir
+}
+
+// resolvedSafeInHome resolves every symlink component of path and re-checks
+// containment against homeDir. Use this before any file read/list/write so
+// that a symlink like `ln -s /etc/passwd ~/workspace/hack` can't bypass the
+// lexical safeInHome check.
+//
+// Returns the fully resolved absolute path and true if safe, or ("", false).
+func resolvedSafeInHome(path string) (string, bool) {
+	resolved, err := filepath.EvalSymlinks(path)
+	if err != nil {
+		return "", false
+	}
+	return resolved, safeInHome(resolved)
 }
 
 func (s *Session) handleFileList(dir string) {
@@ -226,12 +276,16 @@ func (s *Session) handleFileList(dir string) {
 		dir = filepath.Join(workspace, dir)
 	}
 	dir = filepath.Clean(dir)
-	if !safeInHome(dir) {
+	// Resolve symlinks before the containment check: a symlinked directory like
+	// `ln -s /etc ~/workspace/etc_link` would pass the lexical safeInHome check
+	// but ReadDir would expose /etc contents.
+	resolvedDir, ok := resolvedSafeInHome(dir)
+	if !ok {
 		s.sendJSON(map[string]any{"type": "error", "message": "Access denied"})
 		return
 	}
 
-	entries, err := os.ReadDir(dir)
+	entries, err := os.ReadDir(resolvedDir)
 	if err != nil {
 		s.sendJSON(map[string]any{"type": "error", "message": err.Error()})
 		return
@@ -246,7 +300,7 @@ func (s *Session) handleFileList(dir string) {
 		if info == nil {
 			continue
 		}
-		relPath, _ := filepath.Rel(homeDir, filepath.Join(dir, e.Name()))
+		relPath, _ := filepath.Rel(homeDir, filepath.Join(resolvedDir, e.Name()))
 		files = append(files, FileInfo{
 			Name:     e.Name(),
 			Path:     relPath,
@@ -255,7 +309,7 @@ func (s *Session) handleFileList(dir string) {
 			IsDir:    e.IsDir(),
 		})
 	}
-	s.sendJSON(map[string]any{"type": "file_list_result", "files": files, "dir": dir})
+	s.sendJSON(map[string]any{"type": "file_list_result", "files": files, "dir": resolvedDir})
 }
 
 func (s *Session) handleFileRead(path string) {
@@ -271,16 +325,19 @@ func (s *Session) handleFileRead(path string) {
 			fullPath = filepath.Join(homeDir, filepath.Clean("/"+path))
 		}
 	}
-	if !safeInHome(fullPath) {
+	// Resolve symlinks before the containment check: `ln -s /etc/passwd workspace/hack`
+	// passes the lexical safeInHome but ReadFile would return /etc/passwd contents.
+	resolvedPath, ok := resolvedSafeInHome(fullPath)
+	if !ok {
 		s.sendJSON(map[string]any{"type": "error", "message": "Access denied"})
 		return
 	}
-	data, err := os.ReadFile(fullPath)
+	data, err := os.ReadFile(resolvedPath)
 	if err != nil {
 		s.sendJSON(map[string]any{"type": "error", "message": err.Error()})
 		return
 	}
-	relPath, _ := filepath.Rel(homeDir, fullPath)
+	relPath, _ := filepath.Rel(homeDir, resolvedPath)
 	s.sendJSON(map[string]any{
 		"type":    "file_content",
 		"path":    relPath,
@@ -298,6 +355,16 @@ func (s *Session) handleFileWrite(path, content string) {
 	if !safeInHome(fullPath) {
 		s.sendJSON(map[string]any{"type": "error", "message": "Access denied"})
 		return
+	}
+	// If the target already exists, resolve its symlinks and re-verify containment.
+	// Prevents writing through a symlink to a file outside homeDir.
+	if _, lstatErr := os.Lstat(fullPath); lstatErr == nil {
+		resolved, ok := resolvedSafeInHome(fullPath)
+		if !ok {
+			s.sendJSON(map[string]any{"type": "error", "message": "Access denied"})
+			return
+		}
+		fullPath = resolved
 	}
 	// Normalize line endings
 	normalized := strings.ReplaceAll(content, "\r\n", "\n")
@@ -413,9 +480,21 @@ func handleWS(w http.ResponseWriter, r *http.Request) {
 }
 
 func main() {
+	// Read token first, then immediately scrub it from the process environment.
+	// Without this, any user can do `cat /proc/1/environ` and steal the WS_TOKEN.
+	wsToken = os.Getenv("WS_TOKEN")
 	if wsToken == "" {
 		log.Fatal("WS_TOKEN env variable is required")
 	}
+	os.Unsetenv("WS_TOKEN")
+
+	// As PID 1 in the container's PID namespace, the Linux kernel will NOT
+	// deliver SIGKILL from user processes (init protection). However, Go's runtime
+	// registers a SIGTERM handler by default that calls os.Exit — bypassing that
+	// protection. Ignoring SIGTERM/SIGHUP restores the kernel-level protection,
+	// so `kill 1` and `kill -HUP 1` become no-ops from the user's bash.
+	signal.Ignore(syscall.SIGTERM, syscall.SIGHUP)
+
 	if err := os.MkdirAll(workspace, 0755); err != nil {
 		log.Fatal("Cannot create workspace:", err)
 	}
